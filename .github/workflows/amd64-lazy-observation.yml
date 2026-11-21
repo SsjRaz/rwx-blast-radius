@@ -1,0 +1,518 @@
+name: Observe pristine lazy import on AMD64
+
+on:
+  push:
+    branches:
+      - validation/amd64-lazy-observation-0063a44d
+    paths:
+      - .github/workflows/amd64-lazy-observation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      UPSTREAM: eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+      IMAGE: rwx-lazy-observe:check
+      ORGANIZER_LOCK_SHA256: 4201e26c5e438697189dbfb809917eb8618d488a6926eee0f49858aad971d212
+    steps:
+      - name: Build the audit environment with exact pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          cd "$RUNNER_TEMP"
+          mkdir build
+          cd build
+          git init --quiet upstream
+          git -C upstream fetch --quiet --depth 1 https://github.com/tobymao/sqlglot.git "$UPSTREAM"
+          git -C upstream checkout --quiet --detach FETCH_HEAD
+          test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM"
+          test -z "$(git -C upstream status --porcelain --untracked-files=all)"
+          printf '%s\n' 'upstream/.git' > .dockerignore
+          cat > requirements.audit.txt <<'PINS'
+          execnet==2.1.2
+          iniconfig==2.3.1
+          packaging==26.3
+          pluggy==1.7.0
+          Pygments==2.21.0
+          pytest==9.2.0
+          pytest-timeout==2.4.0
+          pytest-xdist==3.8.0
+          typing_extensions==4.16.0
+          PINS
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+          COPY requirements.audit.txt /opt/audit/requirements.txt
+          RUN python -m pip install --disable-pip-version-check --no-cache-dir --only-binary=:all: \
+              --index-url https://pypi.org/simple --no-deps -r /opt/audit/requirements.txt \
+              && python -m pip check
+          COPY upstream /src
+          WORKDIR /src
+          DOCKERFILE
+          timeout 480s docker build --platform linux/amd64 --tag "$IMAGE" .
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = linux/amd64
+          printf 'source=%s full_organizer_lock_sha256=%s\n' "$UPSTREAM" "$ORGANIZER_LOCK_SHA256"
+          docker image inspect --format 'audit_image_id={{.Id}} platform={{.Os}}/{{.Architecture}}' "$IMAGE"
+
+      - name: Run the trusted node and controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir audit
+          cat > audit/audit_lazy.py <<'RWX_OBSERVER_0'
+          """Run a bounded baseline-only audit for exactly one trusted sqlglot test."""
+          import argparse
+          import ast
+          from collections import Counter, defaultdict
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import secrets
+          import subprocess
+          import sys
+          
+          PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+          NODE = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
+          TOOL = Path(__file__).resolve().parent
+          
+          
+          def digest(raw):
+              return [len(raw),hashlib.sha256(raw).hexdigest()]
+          
+          
+          def issuer_code(root):
+              text = (root/"tests/dialects/test_dialect.py").read_bytes()
+              tree = ast.parse(text)
+              found = [n for cls in tree.body if isinstance(cls,ast.ClassDef) and cls.name == "TestDialect"
+                       for n in cls.body if isinstance(n,ast.FunctionDef) and n.name == "test_lazy_load"]
+              assigns = [n for n in found[0].body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="code" for t in n.targets)]
+              assert len(found)==len(assigns)==1 and isinstance(assigns[0].value,ast.Constant)
+              return assigns[0].value.value
+          
+          
+          def clean_environment(root):
+              env = {k:v for k,v in os.environ.items() if not k.startswith("RWXL_")}
+              extra = [s for s in env.get("PYTHONPATH","").split(os.pathsep)
+                       if s and Path(s).resolve() != TOOL]
+              env.update(PYTHONPATH=os.pathsep.join([str(root),*extra]),PYTHONDONTWRITEBYTECODE="1",
+                         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",SKIP_INTEGRATION="0",PYTHONHASHSEED="0")
+              return env
+          
+          
+          def run(args,root,extra=None):
+              env=clean_environment(root)
+              if extra:
+                  env.update(extra)
+              p=subprocess.Popen([sys.executable,*args],cwd=root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              out,err=p.communicate(timeout=65)
+              if p.returncode:
+                  raise RuntimeError(f"command exited {p.returncode}: {(out+err).decode(errors='replace')[-1500:]}")
+              return p.pid,out,err
+          
+          
+          def observed(label, args, src, package, output):
+              dest = output/label
+              dest.mkdir()
+              token=secrets.token_hex(12)
+              env = clean_environment(src)
+              env.update(RWXL_TOKEN=token,RWXL_SOURCE=str(src),RWXL_PACKAGE=package,RWXL_RECEIPTS=str(dest),
+                         PYTHONPATH=str(TOOL)+os.pathsep+env["PYTHONPATH"])
+              root,out,err=run(args,src,env)
+              starts={}; ends={}
+              for f in dest.glob("*.json"):
+                  d=json.loads(f.read_bytes())
+                  if d["token"] != token: raise ValueError("receipt token mismatch")
+                  pid=int(f.name.split(".")[0])
+                  if d["pid"] != pid: raise ValueError("receipt pid mismatch")
+                  (starts if ".start." in f.name else ends)[pid]=d
+              errors = set()
+              if root not in starts: errors.add("missing_start")
+              if root not in ends: errors.add("missing_end")
+              if set(starts)-set(ends): errors.add("missing_end")
+              if set(ends)-set(starts): errors.add("missing_start")
+              expected={root}
+              for pid,e in ends.items():
+                  if e["opaque"] or e["outside"] or e["preloaded"]:
+                      errors.add("unproven_process_or_source")
+                  for child,_ in e["spawns"]:
+                      if child in expected: errors.add("unexpected_duplicate_pid")
+                      expected.add(child)
+                      if child not in starts: errors.add("missing_start")
+                      elif starts[child]["ppid"] != pid: errors.add("unmatched_parent")
+                      if child not in ends: errors.add("missing_end")
+              if set(starts)-expected: errors.add("orphan_receipt")
+              return root,out,err,starts,ends,errors
+          
+          
+          def causes(ends):
+              paths=defaultdict(set); mods=set(); exc=Counter(); misses=set(); phases=defaultdict(set); reads=set()
+              for e in ends.values():
+                  for phase,groups in e["paths"].items():
+                      for path,ns in groups.items():
+                          paths[path].update(ns)
+                          phases[phase].update((path,n) for n in ns)
+                  mods.update(e["loaded"]); reads.update(e["checkout_reads"])
+                  for ph,p,n,event,typ,cnt in e["exceptions"]: exc[event]+=cnt
+                  misses.update(tuple(pair) for pair in e["misses"])
+              return {p:sorted(ns) for p,ns in sorted(paths.items())}, sorted(mods),dict(exc),sorted(misses),{k:len(v) for k,v in phases.items()},sorted(reads)
+          
+          
+          def controls(dest):
+              source=dest/"toy"
+              pkg=source/"toyapp"
+              pkg.mkdir(parents=True)
+              (pkg/"__init__.py").write_text("def use():\n    from .late import check\n    return check()\n")
+              (pkg/"late.py").write_text("from importlib import import_module\ndef check():\n    try:\n        import_module('toyapp.missing_example')\n    except ModuleNotFoundError:\n        pass\n    try:\n        raise ValueError('example')\n    except ValueError:\n        return 7\n")
+              grand="from toyapp import use; assert use()==7; print('ok')"
+              middle=f"import subprocess,sys; r=subprocess.run([sys.executable,'-c',{grand!r}],capture_output=True,text=True,check=True); print(r.stdout.strip())"
+              parent=f"import subprocess,sys; r=subprocess.run([sys.executable,'-c',{middle!r}],capture_output=True,text=True,check=True); print(r.stdout.strip())"
+              plain=run(["-c",parent],source)
+              _,out,err,_,ends,errors=observed("nested",["-c",parent],source,"toyapp",dest)
+              p,m,ex,misses,_,_=causes(ends)
+              assert (out,err)==plain[1:] and not errors and len(ends)==3
+              assert "toyapp/late.py" in p and "toyapp.late" in m and {x[0] for x in misses} >= {"toyapp.missing_example"}
+              assert ex.get("RAISE",0)>0 and ex.get("EXCEPTION_HANDLED",0)>0
+              for label,flags,subsnippet,expected in [("no_site",["-S"],"pass","missing_start"),
+                  ("no_final",[],"import os; os._exit(0)","missing_end")]:
+                  snippet=f"import subprocess,sys; subprocess.run([sys.executable,*{flags!r},'-c',{subsnippet!r}],check=True)"
+                  *_,errors=observed(label,["-c",snippet],source,"toyapp",dest)
+                  assert expected in errors, (label,errors)
+              return {"nested":True,"caught_exception":True,"missing_start_rejected":True,"missing_end_rejected":True}
+          
+          
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument("--checkout",required=True,type=Path)
+              ap.add_argument("--output",required=True,type=Path)
+              a=ap.parse_args()
+              root=a.checkout.resolve()
+              dest=a.output.resolve()
+              dest.mkdir(parents=True,exist_ok=False)
+              code=issuer_code(root)
+              # Verify via Git when available, or via an independently supplied tree attestation.
+              if (root/".git").exists():
+                  pin=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
+                  if pin!=PIN or subprocess.check_output(["git","-C",str(root),"diff","--name-only","HEAD","--","sqlglot",NODE.split("::")[0]]):
+                      raise RuntimeError("baseline differs from pin")
+              elif os.environ.get("RWXL_VERIFIED_SOURCE_SHA")!=PIN:
+                  raise RuntimeError("missing source attestation for non-Git checkout")
+              argv=["-m","pytest","-q","-p","no:cacheprovider"]
+              _,plain,plain_err=run(argv+[NODE],root)
+              starter,out,err,starts,ends,errors=observed("real",argv+["-p","phase_plugin",NODE],root,"sqlglot",dest)
+              assert b"1 passed" in plain and b"1 passed" in out and not errors,sorted(errors)
+              assert not plain_err and not err,(plain_err[:250],err[:250])
+              assert len(ends)==2 and ends[starter]["spawns"][0][1]=="call"
+              assert ends[starter]["phase_history"]==["startup","collection","setup","call","teardown","session_finish"]
+              child=ends[starter]["spawns"][0][0]
+              assert starts[child]["argv"]==digest(json.dumps(["-c",code],separators=(",",":")).encode())
+              _,gold,gold_err=run(["-c",code],root)
+              assert gold==b"Success\n"
+              assert ends[starter]["comms"][str(child)] == [0,digest(gold),digest(gold_err)]
+              state="\nimport sys\nkeys=sorted(str(k) for k in sqlglot.Dialect._classes)\nnames=sorted(n for n in sys.modules if n=='sqlglot' or n.startswith('sqlglot.'))\nprint(__import__('json').dumps([keys,names]))"
+              _,refstate,_=run(["-c",code+state],root)
+              assert json.loads(refstate.splitlines()[-1])==[ends[child]["reg"],ends[child]["loaded"]]
+              controls_ok=controls(dest)
+              paths,mods,exc,misses,phases,reads=causes(ends)
+              package_paths={p:ns for p,ns in paths.items() if p.startswith("sqlglot/")}
+              assert package_paths and all((root/p).is_file() for p in package_paths)
+              parent_dep_count=sum(len(v) for v in causes({starter:ends[starter]})[0].values())
+              child_paths=causes({child:ends[child]})[0]
+              child_lines=sum(len(v) for v in child_paths.values())
+              if not child_lines:
+                  raise RuntimeError("child coverage empty")
+              all_data={"version":1,"pin":PIN,"nodeid":NODE,"complete":True,"lines":package_paths,"modules":mods,
+                        "checkout_reads":reads,"unresolved_import_attempts":misses,"phase_counts":phases}
+              buffer=json.dumps(all_data,sort_keys=True,separators=(",",":")).encode()
+              (dest/"dependencies.json.gz").write_bytes(gzip.compress(buffer,mtime=0))
+              print(json.dumps({"status":"ok","nodeid":NODE,"python":platform.python_version(),"arch":platform.machine(),
+                  "root_plus_child_receipts":len(ends),"parent_project_lines":parent_dep_count,"child_project_lines":child_lines,
+                  "union_project_files":len(package_paths),"union_project_lines":sum(map(len,package_paths.values())),
+                  "fresh_child_module_count":len(ends[child]["loaded"]),"registry_count":len(ends[child]["reg"]),
+                  "child_stdout_sha256":digest(gold)[1],"child_stderr_bytes":len(gold_err),"child_stderr_sha256":digest(gold_err)[1],"source_hash":digest((root/NODE.split('::')[0]).read_bytes())[1],
+                  "dependency_sha256":digest(buffer)[1],"exceptions":exc,"phase_counts":phases,
+                  "failed_import_count":len(misses),"controls":controls_ok},sort_keys=True))
+          if __name__=="__main__":
+              main()
+          RWX_OBSERVER_0
+          cat > audit/lazy_probe.py <<'RWX_OBSERVER_1'
+          """First-party Python child and line receipts for a single trusted workload."""
+          import atexit
+          import hashlib
+          import importlib._bootstrap as bootstrap
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          from threading import local
+          
+          phase = "startup"
+          _phase_history = ["startup"]
+          _state = local()
+          _spawns = []
+          _opaque = []
+          _lines = {}
+          _exceptions = {}
+          _modules = set()
+          _missed_imports = set()
+          _imports = set()
+          _read_paths = set()
+          _comms = {}
+          _files = {}
+          _started = False
+          _tool = 4
+          _ROOT = ""
+          _PREFIX = ""
+          _SUBDIR = ""
+          _RECEIPTS = None
+          _PIN = None
+          _TOKEN = None
+          _PID = None
+          _preloaded = []
+          _outside = set()
+          
+          
+          def _save(suffix, data):
+              f = _RECEIPTS / f"{_PID}.{suffix}.json"
+              tmp = f.with_suffix(".tmp")
+              tmp.write_text(json.dumps(data, sort_keys=True, separators=(",",":")), encoding="utf-8")
+              tmp.replace(f)
+          
+          
+          def _bytes(data):
+              if data is None:
+                  return None
+              if isinstance(data, str):
+                  data = data.encode()
+              return [len(data), hashlib.sha256(data).hexdigest()]
+          
+          
+          def _record_comm(pid, code, out, err):
+              _comms[str(pid)] = [code, _bytes(out), _bytes(err)]
+          
+          
+          def _file(code):
+              name = code.co_filename
+              if name.startswith(_PREFIX) and name.endswith(".py"):
+                  return name[len(_ROOT):]
+              return None
+          
+          
+          def _path(code):
+              if code not in _files:
+                  _files[code] = _file(code)
+              return _files[code]
+          
+          
+          def _point(code, n):
+              f = _path(code)
+              if f and n and n > 0:
+                  _lines.setdefault(phase, {}).setdefault(f,set()).add(n)
+          
+          
+          def _line(code, n):
+              _point(code,n)
+              return sys.monitoring.DISABLE
+          
+          
+          def _code(code, offset, *_):
+              if _path(code):
+                  _point(code,code.co_firstlineno)
+                  sys.monitoring.set_local_events(_tool,code,sys.monitoring.events.LINE)
+                  if code.co_name == "<module>":
+                      _modules.add(_path(code))
+              return sys.monitoring.DISABLE
+          
+          
+          def _exc(name):
+              def event(code, offset, exc):
+                  if _path(code):
+                      # PEP 657 positions include expression lines even in exception-only exits.
+                      frame = sys._getframe().f_back
+                      n = frame.f_lineno if frame is not None and frame.f_code is code else None
+                      if n:
+                          _point(code,n)
+                      key = (phase,_path(code), n or 0, name, type(exc).__name__)
+                      _exceptions[key] = _exceptions.get(key,0) + 1
+              return event
+          
+          
+          def change_phase(name):
+              global phase
+              phase = name
+              _phase_history.append(name)
+              sys.monitoring.restart_events()
+          
+          
+          def _audit(event,args):
+              if event == "subprocess.Popen":
+                  if not getattr(_state,"launch",False):
+                      _opaque.append([phase,event])
+              elif event in {"os.system","os.exec","os.spawn","os.fork","os.forkpty","os.posix_spawn","_posixsubprocess.fork_exec"}:
+                  if not getattr(_state,"launch",False):
+                      _opaque.append([phase,event])
+              elif event in {"open","os.listdir","os.scandir"} and args:
+                  f = args[0]
+                  if isinstance(f,(str, bytes)):
+                      value = os.fsdecode(f)
+                      if not os.path.isabs(value):
+                          value = os.path.normpath(os.path.join(os.getcwd(),value))
+                      if value.startswith(_ROOT):
+                          _read_paths.add(value[len(_ROOT):])
+          
+          
+          def _install_spawns():
+              old_init = subprocess.Popen.__init__
+              old_comm = subprocess.Popen.communicate
+              def init(self,*args,**kwargs):
+                  previous = getattr(_state,"launch",False)
+                  _state.launch = True
+                  try:
+                      try:
+                          old_init(self,*args,**kwargs)
+                      except BaseException:
+                          _opaque.append([phase,"Popen initiation failed"])
+                          raise
+                  finally:
+                      _state.launch = previous
+                  _spawns.append([self.pid,phase])
+              def communicate(self,*args,**kwargs):
+                  out, err = old_comm(self,*args,**kwargs)
+                  _record_comm(self.pid,self.returncode,out,err)
+                  return out,err
+              subprocess.Popen.__init__ = init
+              subprocess.Popen.communicate = communicate
+          
+          
+          def _install_imports():
+              old = bootstrap._find_and_load
+              def load(name,func):
+                  subject = name == _SUBDIR or name.startswith(_SUBDIR+".")
+                  f = None
+                  fr = sys._getframe().f_back
+                  while fr:
+                      if fr.f_code.co_filename.startswith(_PREFIX):
+                          f = _path(fr.f_code)
+                          break
+                      fr = fr.f_back
+                  if subject or f:
+                      _imports.add(name)
+                  try:
+                      mod = old(name,func)
+                  except BaseException as exc:
+                      if subject or f:
+                          _missed_imports.add((name,type(exc).__name__))
+                      raise
+                  if subject:
+                      origin = getattr(getattr(mod,"__spec__",None),"origin",None)
+                      if origin and not origin.startswith(_PREFIX):
+                          _outside.add(name)
+                  return mod
+              bootstrap._find_and_load = load
+          
+          
+          def _finish():
+              if os.getpid() != _PID:
+                  return
+              sys.monitoring.set_events(_tool,0)
+              modules = {n for n in sys.modules if n==_SUBDIR or n.startswith(_SUBDIR+".")}
+              reg = None
+              if _SUBDIR == "sqlglot" and "sqlglot" in sys.modules:
+                  dialect = vars(sys.modules["sqlglot"]).get("Dialect")
+                  if dialect is not None:
+                      reg = sorted(str(k) for k in getattr(dialect,"_classes",{}))
+              _save("end",{"pid":_PID,"ppid":os.getppid(),"token":_TOKEN,"spawns":_spawns,
+                  "phase_history":_phase_history,"opaque":_opaque,"comms":_comms,"paths":{ph:{p:sorted(ns) for p,ns in rows.items()} for ph,rows in _lines.items()},
+                  "exceptions":[[*k,v] for k,v in sorted(_exceptions.items())],"loaded":sorted(modules),
+                  "module_files":sorted(_modules),"reg":reg,"imports":sorted(_imports),"misses":sorted(_missed_imports),
+                  "checkout_reads":sorted(_read_paths),"preloaded":_preloaded,"outside":sorted(_outside)})
+          
+          
+          def start():
+              global _started,_ROOT,_PREFIX,_SUBDIR,_RECEIPTS,_TOKEN,_PID,_preloaded
+              if _started:
+                  return
+              _started = True
+              _TOKEN = os.environ["RWXL_TOKEN"]
+              _RECEIPTS = Path(os.environ["RWXL_RECEIPTS"])
+              _ROOT = os.path.realpath(os.environ["RWXL_SOURCE"]) + os.sep
+              _SUBDIR = os.environ["RWXL_PACKAGE"]
+              _PREFIX = _ROOT + _SUBDIR + os.sep
+              _PID = os.getpid()
+              _preloaded = sorted(n for n in sys.modules if n==_SUBDIR or n.startswith(_SUBDIR+"."))
+              _save("start",{"pid":_PID,"ppid":os.getppid(),"token":_TOKEN,
+                  "argv":_bytes(json.dumps(sys.orig_argv[1:],separators=(",",":"))),"python":sys.version.split()[0]})
+              atexit.register(_finish)
+              _install_spawns()
+              _install_imports()
+              sys.addaudithook(_audit)
+              mon = sys.monitoring
+              mon.use_tool_id(_tool,"trusted-lazy-dependencies")
+              events = mon.events
+              flags = 0
+              for ev in (events.PY_START,events.PY_RESUME):
+                  mon.register_callback(_tool,ev,_code)
+                  flags |= ev
+              mon.register_callback(_tool,events.LINE,_line)
+              for key in ("RAISE","RERAISE","EXCEPTION_HANDLED","PY_THROW","PY_UNWIND"):
+                  ev = getattr(events,key)
+                  mon.register_callback(_tool,ev,_exc(key))
+                  flags |= ev
+              mon.set_events(_tool,flags)
+          RWX_OBSERVER_1
+          cat > audit/phase_plugin.py <<'RWX_OBSERVER_2'
+          """Tag pytest phases without importing any project module."""
+          import pytest
+          from lazy_probe import change_phase
+          
+          
+          def pytest_sessionstart(session):
+              change_phase("collection")
+          
+          
+          @pytest.hookimpl(wrapper=True,tryfirst=True)
+          def pytest_runtest_setup(item):
+              change_phase("setup")
+              return (yield)
+          
+          
+          @pytest.hookimpl(wrapper=True,tryfirst=True)
+          def pytest_runtest_call(item):
+              change_phase("call")
+              return (yield)
+          
+          
+          @pytest.hookimpl(wrapper=True,tryfirst=True)
+          def pytest_runtest_teardown(item):
+              change_phase("teardown")
+              return (yield)
+          
+          
+          def pytest_sessionfinish(session,exitstatus):
+              change_phase("session_finish")
+          RWX_OBSERVER_2
+          cat > audit/sitecustomize.py <<'RWX_OBSERVER_3'
+          """Observer is inactive unless enabled by the dedicated ephemeral audit harness."""
+          import os
+          if os.environ.get("RWXL_TOKEN"):
+              from lazy_probe import start
+              start()
+          RWX_OBSERVER_3
+          chmod 755 audit
+          chmod 644 audit/*.py
+          sha256sum audit/*.py
+          timeout 180s docker run --rm --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 \
+            --env HOME=/tmp --env SKIP_INTEGRATION=0 --env PYTHONDONTWRITEBYTECODE=1 \
+            --env RWXL_VERIFIED_SOURCE_SHA="$UPSTREAM" \
+            --volume "$PWD/audit:/audit:ro" "$IMAGE" python /audit/audit_lazy.py --checkout /src --output /tmp/lazy-audit
