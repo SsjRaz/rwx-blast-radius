@@ -1,0 +1,78 @@
+name: Baseline AMD64 container smoke test
+
+on:
+  push:
+    branches:
+      - validation/amd64-baseline-4eebcc1-0063a44d
+    paths:
+      - .github/workflows/amd64-baseline-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      BASELINE: 4eebcc1dc424fe6026c313a81cc397a53485824c
+    steps:
+      - name: Fetch and build the pinned baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          git init --quiet source
+          git -C source fetch --quiet --depth=1 https://github.com/SsjRaz/rwx-blast-radius.git "$BASELINE"
+          git -C source checkout --quiet --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$BASELINE"
+          timeout 600s docker build --platform linux/amd64 --tag rwx-baseline:check source
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' rwx-baseline:check)" = linux/amd64
+
+      - name: Exercise the default entrypoint on two synthetic changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir -p synthetic/commits
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("synthetic")
+          tests = [
+              {"number": 0, "id": "tests/test_optimizer.py::test_synthetic", "file": "tests/test_optimizer.py", "seconds": 0.1},
+              {"number": 1, "id": "tests/test_demo.py::test_synthetic", "file": "tests/test_demo.py", "seconds": 0.3},
+          ]
+          (root / "tests.json").write_text(json.dumps({"tests": tests, "skipped": []}), encoding="utf-8")
+          for label, path in [
+              ("full", "sqlglot/synthetic.py"),
+              ("fixture", "tests/fixtures/optimizer/normalize.sql"),
+          ]:
+              patch = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-before\n+after\n"
+              (root / "commits" / f"{label}.patch").write_text(patch, encoding="utf-8")
+          PY
+          chmod 755 synthetic/commits
+          chmod 644 synthetic/commits/*.patch synthetic/tests.json
+          timeout 180s docker run --rm --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+            --volume "$PWD/synthetic/commits:/data/commits:ro" \
+            --volume "$PWD/synthetic/tests.json:/data/tests.json:ro" \
+            rwx-baseline:check > output.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          raw = Path("output.jsonl").read_bytes()
+          assert 0 < len(raw) < 2_000_000
+          records = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+          expected = [
+              {"commit": "fixture", "workers": [[0]]},
+              {"commit": "full", "workers": [[1, 0]]},
+          ]
+          assert records == expected, records
+          print(f"{len(records)} expected records, {len(raw)} bytes:")
+          print(raw.decode("utf-8"), end="")
+          PY
