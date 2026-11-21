@@ -36,8 +36,8 @@ HEADER = re.compile(rb"diff --git a/([A-Za-z0-9_./-]+) b/([A-Za-z0-9_./-]+)")
 OPTIMIZER_TEST = "tests/test_optimizer.py"
 
 
-def optimizer_fixture_only(data, known_paths):
-    found = False
+def fixture_paths(data, known_paths):
+    found = set()
     current = None
     old_path = new_path = False
     for line in data.splitlines():
@@ -49,7 +49,7 @@ def optimizer_fixture_only(data, known_paths):
                 return False
             current = m[1]
             old_path = new_path = False
-            found = True
+            found.add(current)
         elif line.startswith(b"--- "):
             if current is None or line != b"--- a/" + current or old_path:
                 return False
@@ -58,7 +58,11 @@ def optimizer_fixture_only(data, known_paths):
             if current is None or line != b"+++ b/" + current or new_path:
                 return False
             new_path = True
-    return found and old_path and new_path
+    return found if old_path and new_path else set()
+
+
+def optimizer_fixture_only(data, known_paths):
+    return bool(fixture_paths(data, known_paths))
 
 
 def main():
@@ -70,9 +74,20 @@ def main():
     optimizer = [test for test in tests if test["file"] == OPTIMIZER_TEST]
     optimizer_plan = json.dumps(schedule(optimizer), separators=(",", ":")) if optimizer else full_plan
     paths = json.loads(Path(__file__).with_name("optimizer_fixtures.json").read_text())
-    known = frozenset(path.encode("ascii") for path in paths)
+    known = {path.encode("ascii"): set(ids) for path, ids in paths.items()}
+    by_id = {test["id"]: test for test in tests}
     for patch in sorted((args.data / "commits").glob("*.patch")):
-        plan = optimizer_plan if optimizer_fixture_only(patch.read_bytes(), known) else full_plan
+        touched = fixture_paths(patch.read_bytes(), known)
+        plan = full_plan
+        if touched:
+            candidates = [known[path] for path in touched]
+            # Use the module fallback if any fixture lacks a proven direct
+            # consumer or the catalog does not have the expected ID.
+            if all(ids and ids <= by_id.keys() for ids in candidates):
+                selected = set().union(*candidates)
+                plan = json.dumps(schedule(by_id[i] for i in selected), separators=(",", ":"))
+            else:
+                plan = optimizer_plan
         print('{"commit":' + json.dumps(patch.stem) + ',"workers":' + plan + '}')
 
 

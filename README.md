@@ -8,13 +8,22 @@ to at most eight workers. No sample data or answers are required at runtime.
 
 Code, unknown paths, unusual patch headers and mixed changes use the full
 suite. A patch confined to existing top-level optimizer SQL fixtures uses
-all catalogued tests in `tests/test_optimizer.py`. The fixture allowlist was
-derived by listing `tests/fixtures/optimizer/*.sql` in the organizer's pinned
-sqlglot revision `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, excluding
-subdirectories; the root fixture directory is accessed through the fixture
-loaders in that test module. This is a deliberately conservative
-module-level dependency rather than a prediction of individual failures.
-It is not a formal guarantee of hidden-case recall.
+the union of their direct consumers in `tests/test_optimizer.py` where each
+consumer is established in the organizer's pinned source and present in the
+test catalog. If a known fixture has no mapped consumer or its consumer is
+missing from the catalog, the selector runs the optimizer test module (or
+the full suite if that module is missing).
+
+`generate_fixture_map.py` builds the map from literal arguments to the
+pinned module's fixture-loader calls at sqlglot revision
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It does not use sample patches,
+answers, scores, or observed outcomes. Regenerate the checked-in map with:
+
+```sh
+python3 generate_fixture_map.py /path/to/sqlglot-git-checkout > optimizer_fixtures.json
+```
+
+Static ownership is not a formal guarantee of hidden-case recall.
 
 For each selection set, test durations are converted to the scorer's integer
 milliseconds. Longest-first placement balances worker loads. The selector

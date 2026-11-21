@@ -1,4 +1,9 @@
 import unittest
+import json
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from selector import optimizer_fixture_only, schedule
 
 
@@ -21,6 +26,31 @@ class SelectorTests(unittest.TestCase):
         self.assertFalse(optimizer_fixture_only(patch(a), set()))
         self.assertFalse(optimizer_fixture_only(patch(a).split(b"\n")[0], {a}))
         self.assertFalse(optimizer_fixture_only(b"", {a}))
+
+    def test_local_batch_routes_on_static_ownership(self):
+        script = Path(__file__).with_name("selector.py")
+        ownership = json.loads(script.with_name("optimizer_fixtures.json").read_text())
+        (first, a), (second, b) = [(p, owners) for p, owners in ownership.items() if owners][:2]
+        ids = sorted(set(a + b))
+        extra = "tests/test_optimizer.py::TestOptimizer::test_unrelated"
+        outside = "tests/test_other.py::TestOther::test_unrelated"
+        catalog = [{"id": n, "file": n.split("::")[0], "seconds": 0.01, "number": i}
+                   for i, n in enumerate([*ids, extra, outside])]
+        def patch(p):
+            return f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n-SELECT 1;\n+SELECT 2;\n"
+        with TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            patch_dir = data / "commits"
+            patch_dir.mkdir()
+            (data / "tests.json").write_text(json.dumps({"tests": catalog}))
+            (patch_dir / "owned.patch").write_text(patch(first))
+            (patch_dir / "two.patch").write_text(patch(first) + patch(second))
+            (patch_dir / "mixed.patch").write_text(patch(first) + patch("sqlglot/unknown.py"))
+            answer = subprocess.check_output([sys.executable, script, "--data", data], text=True)
+            observed = {j["commit"]: {catalog[n]["id"] for w in j["workers"] for n in w}
+                        for j in map(json.loads, answer.splitlines())}
+            self.assertEqual(observed, {"owned": set(a), "two": set(ids), "mixed": {*ids, extra, outside}})
+
 
 
 if __name__ == "__main__":
