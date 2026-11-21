@@ -1,4 +1,4 @@
-name: Baseline AMD64 container smoke test
+name: Baseline AMD64 validation
 
 on:
   push:
@@ -75,4 +75,119 @@ jobs:
           assert records == expected, records
           print(f"{len(records)} expected records, {len(raw)} bytes:")
           print(raw.decode("utf-8"), end="")
+          PY
+
+      - name: Verify and stage the public sample outside the build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir public-check
+          cd public-check
+          curl --proto '=https' --proto-redir '=https' --location --fail --silent --show-error \
+            --connect-timeout 10 --max-time 45 --max-filesize 100000 --retry 1 \
+            --output sample.tar.gz \
+            https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz
+          test "$(wc -c < sample.tar.gz)" -eq 38398
+          printf '%s  sample.tar.gz\n' 81efabbc69c3c4367d928f2dba0f33ce9dccccbd080b54721b2636e5d8afab9d | sha256sum --check -
+          python3 - <<'PY'
+          import re
+          import tarfile
+          from pathlib import Path
+
+          root = Path("kit")
+          commits = root / "sample" / "commits"
+          commits.mkdir(parents=True)
+          extras = {"Dockerfile", "Makefile", "README.md", "SCORING.md", "requirements.lock", "selector.py"}
+          selected = {"score.py", "sample/tests.json", "sample/answers.json"}
+          patch = re.compile(r"sample/commits/[a-zA-Z0-9][a-zA-Z0-9_-]{0,80}\.patch")
+          with tarfile.open("sample.tar.gz", "r:gz") as tar:
+              members = tar.getmembers()
+              names = {m.name for m in members}
+              assert len(names) == len(members) == 39
+              assert selected | extras <= names
+              assert sum(patch.fullmatch(name) is not None for name in names) == 30
+              assert all(m.type in (tarfile.REGTYPE, tarfile.AREGTYPE) for m in members)
+              assert sum(m.size for m in members) < 1_000_000
+              for member in members:
+                  if member.name in extras:
+                      continue
+                  assert member.name in selected or patch.fullmatch(member.name)
+                  destination = root / member.name
+                  with destination.open("xb") as output:
+                      data = tar.extractfile(member).read()
+                      assert len(data) == member.size
+                      output.write(data)
+                  destination.chmod(0o644)
+          commits.chmod(0o755)
+          PY
+
+      - name: Score three default container runs and measure child CPU separately
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/public-check"
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          kit = Path("kit").resolve()
+          sample = kit / "sample"
+          image = "rwx-baseline:check"
+          flags = [
+              "timeout", "180s", "docker", "run", "--rm", "--platform", "linux/amd64",
+              "--network", "none", "--cpus", "2", "--memory", "4096m", "--memory-swap", "4096m",
+              "--pids-limit", "256", "--read-only", "--tmpfs", "/tmp:rw,size=64m,mode=1777",
+              "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+              "--user", "65534:65534", "--env", "HOME=/tmp",
+              "--volume", f"{sample / 'commits'}:/data/commits:ro",
+              "--volume", f"{sample / 'tests.json'}:/data/tests.json:ro",
+              image,
+          ]
+          expected_hash = "ab5d4576d611e6df92cd16afd3ddba6920d6f80347b59caead5ccfed5560848d"
+
+          def run_selector(label, command):
+              output = Path(label + ".jsonl")
+              with output.open("xb") as stdout:
+                  result = subprocess.run(command, check=True, stdout=stdout, stderr=subprocess.PIPE)
+              raw = output.read_bytes()
+              digest = hashlib.sha256(raw).hexdigest()
+              assert len(raw) < 2_000_000 and len(raw.splitlines()) == 30
+              assert digest == expected_hash, digest
+              return output, len(raw), digest, result.stderr
+
+          def score(output, child_cpu_us=None):
+              args = [sys.executable, "-I", str(kit / "score.py"),
+                      str(sample), str(sample / "answers.json"), str(output)]
+              if child_cpu_us is not None:
+                  args.extend(["--cpu-seconds", f"{child_cpu_us / 1_000_000:.6f}"])
+              report = subprocess.run(args, check=True, capture_output=True, text=True).stdout
+              aggregate = [line for line in report.splitlines()
+                           if line.startswith(("Simulated:", "Misses:", "Total:"))]
+              assert len(aggregate) == (2 if child_cpu_us is None else 3)
+              return "  ".join(aggregate)
+
+          for number in range(1, 4):
+              output, size, digest, _ = run_selector(f"default-{number}", flags)
+              print(f"default {number}: {size} bytes sha256={digest}  {score(output)}", flush=True)
+
+          supervisor = """
+          import resource, subprocess, sys
+          subprocess.run(["python", "/app/selector.py"], check=True)
+          usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+          print("child_cpu_us=" + str(round((usage.ru_utime + usage.ru_stime) * 1_000_000)), file=sys.stderr)
+          """
+          measured = []
+          for number in range(1, 4):
+              output, size, digest, stderr = run_selector(f"supervised-{number}", flags + ["python", "-c", supervisor])
+              match = re.fullmatch(rb"child_cpu_us=(\d+)\n", stderr)
+              assert match
+              child_us = int(match[1])
+              measured.append(child_us)
+              print(f"supervised {number}: {size} bytes sha256={digest}  child_cpu_us={child_us}  {score(output, child_us)}", flush=True)
+          print(f"median_selector_child_cpu_us={statistics.median(measured)}")
           PY
