@@ -34,22 +34,58 @@ jobs:
           test -z "$(git -C upstream status --porcelain --untracked-files=all)"
           printf '%s\n' 'upstream/.git' > .dockerignore
           cat > requirements.audit.txt <<'PINS'
+          ast_serialize==0.13.1
+          cfgv==3.5.0
+          distlib==0.4.4
+          duckdb==2.0.0
           execnet==2.1.2
+          filelock==4.2.12
+          identify==2.6.20
           iniconfig==2.3.1
+          Jinja2==3.1.6
+          librt==0.17.0
+          markdown2==2.5.5
+          MarkupSafe==3.0.4
+          mypy==2.4.1
+          mypy_extensions==1.2.0
+          nodeenv==1.12.0
+          numpy==2.5.5
           packaging==26.3
+          pandas==3.1.1
+          pandas-stubs==3.1.0.261029
+          pathspec==1.1.1
+          pdoc==16.0.0
+          platformdirs==4.14.7
           pluggy==1.7.0
+          pre_commit==4.7.0
+          psutil==7.2.2
           Pygments==2.21.0
+          pyperf==2.11.0
           pytest==9.2.0
           pytest-timeout==2.4.0
           pytest-xdist==3.8.0
+          python-dateutil==4.0.0
+          python-discovery==1.9.6
+          pytz==2026.6
+          PyYAML==6.0.3
+          ruff==0.15.6
+          setuptools==84.2.1
+          setuptools-scm==10.3.4
+          types-python-dateutil==2.9.0.20261116
+          types-pytz==2026.6.0.20261031
           typing_extensions==4.16.0
+          tzdata==2026.6
+          vcs-versioning==2.6.0
+          virtualenv==21.15.9
           PINS
+          printf '%s  requirements.audit.txt\n' "$ORGANIZER_LOCK_SHA256" | sha256sum --check -
           cat > Dockerfile <<'DOCKERFILE'
           FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
           COPY requirements.audit.txt /opt/audit/requirements.txt
-          RUN python -m pip install --disable-pip-version-check --no-cache-dir --only-binary=:all: \
+          RUN python -m pip install --disable-pip-version-check --no-cache-dir --prefer-binary \
               --index-url https://pypi.org/simple --no-deps -r /opt/audit/requirements.txt \
-              && python -m pip check
+              && python -m pip check \
+              && python -c 'from importlib.metadata import version; from pathlib import Path; pins=[x.split("==") for x in Path("/opt/audit/requirements.txt").read_text().splitlines()]; assert len(pins)==43 and all(version(k)==v for k,v in pins); print("verified 43 locked distributions, mypy_extensions="+version("mypy_extensions"))'
           COPY upstream /src
           WORKDIR /src
           DOCKERFILE
@@ -506,6 +542,22 @@ jobs:
               from lazy_probe import start
               start()
           RWX_OBSERVER_3
+          cat > audit/run.sh <<'RWX_RUN_SH'
+          set -eu
+          python /audit/audit_lazy.py --checkout /src --output /tmp/lazy-audit
+          python - <<'PY'
+          import gzip
+          import hashlib
+          import json
+          from pathlib import Path
+
+          p = Path("/tmp/lazy-audit/dependencies.json.gz")
+          with gzip.open(p, "rt", encoding="utf-8") as stream:
+              lines = json.load(stream)["lines"]
+          canonical = json.dumps(lines, sort_keys=True, separators=(",", ":")).encode()
+          print("coverage_projection_sha256=" + hashlib.sha256(canonical).hexdigest())
+          PY
+          RWX_RUN_SH
           chmod 755 audit
           chmod 644 audit/*.py
           sha256sum audit/*.py
@@ -515,4 +567,4 @@ jobs:
             --security-opt no-new-privileges --user 65534:65534 \
             --env HOME=/tmp --env SKIP_INTEGRATION=0 --env PYTHONDONTWRITEBYTECODE=1 \
             --env RWXL_VERIFIED_SOURCE_SHA="$UPSTREAM" \
-            --volume "$PWD/audit:/audit:ro" "$IMAGE" python /audit/audit_lazy.py --checkout /src --output /tmp/lazy-audit
+            --volume "$PWD/audit:/audit:ro" "$IMAGE" sh /audit/run.sh
